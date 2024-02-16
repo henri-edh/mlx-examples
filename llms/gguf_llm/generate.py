@@ -4,34 +4,24 @@ import argparse
 import time
 
 import mlx.core as mx
-import phixtral
-import transformers
+import models
 
 
 def generate(
-    model: phixtral.Model,
-    tokenizer: transformers.AutoTokenizer,
+    model: models.Model,
+    tokenizer: models.GGUFTokenizer,
     prompt: str,
     max_tokens: int,
     temp: float = 0.0,
 ):
-    print("[INFO] Generating with Phixtral...", flush=True)
-    print(prompt, end="", flush=True)
-    prompt = tokenizer(
-        prompt,
-        return_tensors="np",
-        return_attention_mask=False,
-    )[
-        "input_ids"
-    ][0]
-    prompt = mx.array(prompt)
+    prompt = tokenizer.encode(prompt)
 
     tic = time.time()
     tokens = []
     skip = 0
     for token, n in zip(
-        phixtral.generate(prompt, model, temp),
-        range(max_tokens),
+        models.generate(prompt, model, args.temp),
+        range(args.max_tokens),
     ):
         if token == tokenizer.eos_token_id:
             break
@@ -41,7 +31,6 @@ def generate(
             tic = time.time()
 
         tokens.append(token.item())
-        # if (n + 1) % 10 == 0:
         s = tokenizer.decode(tokens)
         print(s[skip:], end="", flush=True)
         skip = len(s)
@@ -58,17 +47,23 @@ def generate(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="inference script")
+    parser = argparse.ArgumentParser(description="Inference script")
     parser.add_argument(
-        "--model",
+        "--gguf",
         type=str,
-        default="mlx_model",
-        help="The path to the local model directory or Hugging Face repo.",
+        help="The GGUF file to load (and optionally download).",
     )
+    parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="The Hugging Face repo if downloading from the Hub.",
+    )
+
     parser.add_argument(
         "--prompt",
         help="The message to be processed by the model",
-        default="Write a detailed analogy between mathematics and a lighthouse.",
+        default="In the beginning the Universe was created.",
     )
     parser.add_argument(
         "--max-tokens",
@@ -87,5 +82,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     mx.random.seed(args.seed)
-    model, tokenizer = phixtral.load(args.model)
+    model, tokenizer = models.load(args.gguf, args.repo)
     generate(model, tokenizer, args.prompt, args.max_tokens, args.temp)

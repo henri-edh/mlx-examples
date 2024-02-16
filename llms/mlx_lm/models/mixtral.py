@@ -3,6 +3,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .base import BaseModelArgs
 
@@ -20,9 +21,9 @@ class ModelArgs(BaseModelArgs):
     num_local_experts: int = 8
     rms_norm_eps: float = 1e-5
     vocab_size: int
+    model_type: str
     rope_theta: float = 1e6
     rope_traditional: bool = False
-    model_type: str = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
     def __post_init__(self):
@@ -94,12 +95,9 @@ class MixtralAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        def repeat(a):
-            a = mx.concatenate([mx.expand_dims(a, 2)] * self.repeats, axis=2)
-            return a.reshape([B, self.num_heads, L, -1])
-
         if self.repeats > 1:
-            keys, values = map(repeat, (keys, values))
+            keys = mx.repeat(keys, self.repeats, axis=1)
+            values = mx.repeat(values, self.repeats, axis=1)
 
         if cache is not None:
             key_cache, value_cache = cache
@@ -158,18 +156,34 @@ class MixtralSparseMoeBlock(nn.Module):
         x = x.reshape(-1, x.shape[-1])
 
         gates = self.gate(x)
-        inds = mx.argpartition(-gates, kth=ne, axis=-1)[:, :ne]
+
+        inds = mx.stop_gradient(
+            mx.argpartition(-gates, kth=ne, axis=-1)[:, :ne]
+        )  # TODO remove it once we figure out how to fine tune TopK in MOE
+
         scores = mx.softmax(
             mx.take_along_axis(gates, inds, axis=-1).astype(mx.float32),
             axis=-1,
         ).astype(gates.dtype)
 
-        y = []
-        for xt, st, it in zip(x, scores, inds.tolist()):
-            yt = mx.concatenate([self.experts[e](xt)[:, None] for e in it], axis=-1)
-            yt = (yt * st).sum(axis=-1)
-            y.append(yt[None, :])
-        y = mx.concatenate(y)
+        if self.training:
+            mx.eval(inds)
+            inds = np.array(inds)
+            y = mx.zeros((x.shape[0], ne, x.shape[-1]))
+            for e, expert in enumerate(self.experts):
+                idx1, idx2 = map(mx.array, np.where(inds == e))
+                if idx1.size == 0:
+                    continue
+                y[idx1, idx2] = expert(x[idx1])
+
+            y = (y * scores[:, :, None]).sum(axis=1)
+        else:
+            y = []
+            for xt, st, it in zip(x, scores, inds.tolist()):
+                yt = mx.concatenate([self.experts[e](xt)[:, None] for e in it], axis=-1)
+                yt = (yt * st).sum(axis=-1)
+                y.append(yt[None, :])
+            y = mx.concatenate(y)
 
         return y.reshape(orig_shape)
 
@@ -229,12 +243,13 @@ class MixtralModel(nn.Module):
         for e, layer in enumerate(self.layers):
             h, cache[e] = layer(h, mask, cache[e])
 
-        return self.norm(h[:, T - 1 : T, :]), cache
+        return self.norm(h), cache
 
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.model_type = args.model_type
         self.model = MixtralModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 

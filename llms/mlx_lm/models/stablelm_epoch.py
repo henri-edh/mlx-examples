@@ -10,20 +10,18 @@ from .base import BaseModelArgs
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    max_position_embeddings: int = 2048
-    vocab_size: int = 51200
-    hidden_size: int = 2560
-    num_attention_heads: int = 32
-    num_hidden_layers: int = 32
-    num_key_value_heads: int = 32
-    partial_rotary_factor: float = 0.4
-    intermediate_size: int = 10240
-    layer_norm_eps: float = 1e-5
-    rope_theta: float = 10000.0
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
+    max_position_embeddings: int
+    model_type: str
+    vocab_size: int
+    hidden_size: int
+    num_attention_heads: int
+    num_hidden_layers: int
+    num_key_value_heads: int
+    rope_pct: float
+    intermediate_size: int
+    norm_eps: float
+    rope_theta: float
+    use_qkv_bias: bool
 
 
 class LayerNorm(nn.LayerNorm):
@@ -31,7 +29,7 @@ class LayerNorm(nn.LayerNorm):
         return super().__call__(x.astype(mx.float32)).astype(x.dtype)
 
 
-class PhiAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
 
@@ -41,7 +39,7 @@ class PhiAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.repeats = self.num_heads // self.num_key_value_heads
         self.rope_theta = config.rope_theta
-        self.partial_rotary_factor = config.partial_rotary_factor
+        self.rope_pct = config.rope_pct
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -50,20 +48,24 @@ class PhiAttention(nn.Module):
             )
 
         self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=True
+            self.hidden_size, self.num_heads * self.head_dim, bias=config.use_qkv_bias
         )
         self.k_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.use_qkv_bias,
         )
         self.v_proj = nn.Linear(
-            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.use_qkv_bias,
         )
-        self.dense = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=True
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
         self.rope = nn.RoPE(
-            int(self.partial_rotary_factor * self.head_dim),
+            int(self.rope_pct * self.head_dim),
             traditional=False,
             base=self.rope_theta,
         )
@@ -85,12 +87,9 @@ class PhiAttention(nn.Module):
             B, L, self.num_key_value_heads, self.head_dim
         ).transpose(0, 2, 1, 3)
 
-        def repeat(a):
-            a = mx.concatenate([mx.expand_dims(a, 2)] * self.repeats, axis=2)
-            return a.reshape([B, self.num_heads, L, -1])
-
         if self.repeats > 1:
-            keys, values = map(repeat, (keys, values))
+            keys = mx.repeat(keys, self.repeats, axis=1)
+            values = mx.repeat(values, self.repeats, axis=1)
 
         # Add RoPE to the queries and keys and combine them with the cache
         if cache is not None:
@@ -115,40 +114,45 @@ class PhiAttention(nn.Module):
         scores = mx.softmax(scores, axis=-1).astype(values.dtype)
         values_hat = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.dense(values_hat), (keys, values)
+        return self.o_proj(values_hat), (keys, values)
 
 
-class PhiMLP(nn.Module):
-    def __init__(self, config: ModelArgs):
+class MLP(nn.Module):
+    def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.act = nn.GELU(approx="precise")
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.fc2(self.act(self.fc1(x)))
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class PhiDecoderLayer(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.self_attn = PhiAttention(config=config)
-        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = PhiMLP(config)
+        self.self_attn = Attention(config=config)
+        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.norm_eps)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.norm_eps)
+        self.post_attention_layernorm = LayerNorm(
+            config.hidden_size, eps=config.norm_eps
+        )
 
     def __call__(self, x, mask, cache):
-        h = self.input_layernorm(x)
-        attn_h, cache = self.self_attn(h, mask, cache)
-        ff_h = self.mlp(h)
-        return attn_h + ff_h + x, cache
+        r, cache = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        r = self.mlp(self.post_attention_layernorm(h))
+        out = h + r
+        return out, cache
 
 
-class PhiModel(nn.Module):
+class StableLM(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = [PhiDecoderLayer(config) for i in range(config.num_hidden_layers)]
-        self.final_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layers = [DecoderLayer(config) for i in range(config.num_hidden_layers)]
+        self.norm = LayerNorm(config.hidden_size, eps=config.norm_eps)
 
     def __call__(self, x, mask, cache):
         x = self.embed_tokens(x)
@@ -157,14 +161,15 @@ class PhiModel(nn.Module):
 
         for e, layer in enumerate(self.layers):
             x, cache[e] = layer(x, mask, cache[e])
-        return self.final_layernorm(x), cache
+        return self.norm(x), cache
 
 
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.model = PhiModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
+        self.model_type = config.model_type
+        self.model = StableLM(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,

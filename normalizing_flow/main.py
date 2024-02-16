@@ -1,15 +1,15 @@
 # Copyright © 2023-2024 Apple Inc.
 
-from tqdm import trange
-import numpy as np
-from sklearn import datasets, preprocessing
-import matplotlib.pyplot as plt
+from functools import partial
 
+import matplotlib.pyplot as plt
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-
+import numpy as np
 from flows import RealNVP
+from sklearn import datasets, preprocessing
+from tqdm import trange
 
 
 def get_moons_dataset(n_samples=100_000, noise=0.06):
@@ -29,18 +29,23 @@ def main(args):
     def loss_fn(model, x):
         return -mx.mean(model(x))
 
-    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     optimizer = optim.Adam(learning_rate=args.learning_rate)
 
+    state = [model.state, optimizer.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(x):
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        loss, grads = loss_and_grad_fn(model, x)
+        optimizer.update(model, grads)
+        return loss
+
     with trange(args.n_steps) as steps:
-        for step in steps:
+        for it in steps:
             idx = np.random.choice(x.shape[0], replace=False, size=args.n_batch)
-            loss, grads = loss_and_grad_fn(model, mx.array(x[idx]))
-
-            optimizer.update(model, grads)
-            mx.eval(model.parameters())
-
-            steps.set_postfix(val=loss)
+            loss = step(mx.array(x[idx]))
+            mx.eval(state)
+            steps.set_postfix(val=loss.item())
 
     # Plot samples from trained flow
 
